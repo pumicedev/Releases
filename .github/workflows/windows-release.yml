@@ -141,13 +141,22 @@ jobs:
             --dir Releases `
             --clobber
 
-          $previousFull = Get-ChildItem Releases -Filter "*-full.nupkg" |
+          $previousFull = Get-ChildItem Releases -Filter "$env:VPK_PACK_ID-*-$env:VPK_CHANNEL-full.nupkg" |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
-          if (-not $previousFull -or $previousFull.Name -notmatch '-(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-full\.nupkg$') {
-            throw "A parseable previous full package is required for the two-version gate"
+          if (-not $previousFull) {
+            throw "A previous full package is required for the two-version gate"
           }
-          $previousVersion = $Matches.version
+          $previousPrefix = "$env:VPK_PACK_ID-"
+          $previousSuffix = "-$env:VPK_CHANNEL-full.nupkg"
+          if (-not $previousFull.Name.StartsWith($previousPrefix) -or -not $previousFull.Name.EndsWith($previousSuffix)) {
+            throw "Could not parse previous version from $($previousFull.Name)"
+          }
+          $previousVersionLength = $previousFull.Name.Length - $previousPrefix.Length - $previousSuffix.Length
+          if ($previousVersionLength -le 0) {
+            throw "Could not parse previous version from $($previousFull.Name)"
+          }
+          $previousVersion = $previousFull.Name.Substring($previousPrefix.Length, $previousVersionLength)
           $previousSetup = Get-ChildItem Releases -Filter "*Setup*.exe" |
             Select-Object -First 1
           if (-not $previousSetup) {
@@ -194,7 +203,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
-        run: .\scripts\test_windows_release_e2e.ps1 -ReleaseDir Releases -CurrentVersion $env:VERSION -InstallRoot (Join-Path $env:RUNNER_TEMP "xrels-e2e")
+        run: .\scripts\test_windows_release_e2e.ps1 -ReleaseDir Releases -CurrentVersion $env:VERSION -InstallRoot (Join-Path $env:RUNNER_TEMP "xrels-e2e") -PackId $env:VPK_PACK_ID -Channel $env:VPK_CHANNEL
 
       - name: Enforce Authenticode signatures when enabled
         if: steps.signing.outputs.enabled == 'true'
@@ -226,10 +235,11 @@ jobs:
           if (Test-Path $env:PREVIOUS_SETUP) {
             Remove-Item $env:PREVIOUS_SETUP -Force
           }
-          $full = Get-ChildItem Releases -Filter "*-$env:VERSION-full.nupkg" |
+          $fullName = "$env:VPK_PACK_ID-$env:VERSION-$env:VPK_CHANNEL-full.nupkg"
+          $full = Get-ChildItem Releases -Filter $fullName |
             Select-Object -First 1
           if (-not $full) {
-            throw "Current full package was not generated"
+            throw "Current full package was not generated: $fullName"
           }
           $sidecar = "$($full.FullName).sha256"
           $hash = (Get-FileHash $full.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

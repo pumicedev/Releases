@@ -4,28 +4,44 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$CurrentVersion,
     [Parameter(Mandatory = $true)]
-    [string]$InstallRoot
+    [string]$InstallRoot,
+    [string]$PackId = "Pumice.XR-ELS",
+    [string]$Channel = "stable"
 )
 
 $ErrorActionPreference = "Stop"
 $ReleaseDir = (Resolve-Path $ReleaseDir).Path
-$CurrentFull = Get-ChildItem $ReleaseDir -Filter "*-$CurrentVersion-full.nupkg" |
+$CurrentFullName = "$PackId-$CurrentVersion-$Channel-full.nupkg"
+$CurrentFull = Get-ChildItem $ReleaseDir -Filter $CurrentFullName |
     Select-Object -First 1
 if (-not $CurrentFull) {
-    throw "Current full package $CurrentVersion is missing"
+    throw "Current full package is missing: $CurrentFullName"
 }
 
-$PreviousFull = Get-ChildItem $ReleaseDir -Filter "*-full.nupkg" |
+$PreviousFull = Get-ChildItem $ReleaseDir -Filter "$PackId-*-$Channel-full.nupkg" |
     Where-Object { $_.FullName -ne $CurrentFull.FullName } |
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1
 if (-not $PreviousFull) {
     throw "A previous full package is required for the two-version release gate"
 }
-if ($PreviousFull.Name -notmatch '-(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-full\.nupkg$') {
+$PreviousPrefix = "$PackId-"
+$PreviousSuffix = "-$Channel-full.nupkg"
+if (
+    -not $PreviousFull.Name.StartsWith($PreviousPrefix) -or
+    -not $PreviousFull.Name.EndsWith($PreviousSuffix)
+) {
     throw "Could not parse previous version from $($PreviousFull.Name)"
 }
-$PreviousVersion = $Matches.version
+$PreviousVersionLength =
+    $PreviousFull.Name.Length - $PreviousPrefix.Length - $PreviousSuffix.Length
+if ($PreviousVersionLength -le 0) {
+    throw "Could not parse previous version from $($PreviousFull.Name)"
+}
+$PreviousVersion = $PreviousFull.Name.Substring(
+    $PreviousPrefix.Length,
+    $PreviousVersionLength
+)
 $PreviousSetup = Get-ChildItem $ReleaseDir -Filter "*Setup*.exe" |
     Where-Object { $_.Name -like "*$PreviousVersion*" } |
     Select-Object -First 1
