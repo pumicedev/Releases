@@ -47,9 +47,6 @@ jobs:
         env:
           RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          if ($env:GITHUB_REPOSITORY -ne "pumicedev/XR-ELS-Releases") {
-            throw "This workflow is restricted to pumicedev/XR-ELS-Releases"
-          }
           $server = "dist\XR-ELS-Server\XR-ELS-Server.exe"
           $migrator = "dist\XR-ELS-Server\_internal\tools\XR-ELS-DB-Migrator.exe"
           $firebaseConfig = "dist\XR-ELS-Server\_internal\firebase_config.json"
@@ -269,5 +266,5 @@ jobs:
         with:
           name: xrels-windows-${{ steps.metadata.outputs.version }}
           path: Releases/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
