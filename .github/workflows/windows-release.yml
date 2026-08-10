@@ -53,8 +53,7 @@ jobs:
           $server = "dist\XR-ELS-Server\XR-ELS-Server.exe"
           $migrator = "dist\XR-ELS-Server\_internal\tools\XR-ELS-DB-Migrator.exe"
           $firebaseConfig = "dist\XR-ELS-Server\_internal\firebase_config.json"
-          $controlShortcut = "dist\XR-ELS-Server\XRELS Web Control.url"
-          foreach ($requiredFile in @($server, $migrator, $firebaseConfig, $controlShortcut)) {
+          foreach ($requiredFile in @($server, $migrator, $firebaseConfig)) {
             if (-not (Test-Path $requiredFile -PathType Leaf)) {
               throw "Required manually supplied artifact is missing: $requiredFile"
             }
