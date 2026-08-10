@@ -1,0 +1,274 @@
+name: Windows stable release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: Markdown release notes
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-stable-release
+  cancel-in-progress: false
+
+env:
+  RELEASE_REPOSITORY: https://github.com/${{ github.repository }}
+  RELEASE_REPO_SLUG: ${{ github.repository }}
+  VPK_CHANNEL: stable
+  VPK_PACK_ID: Pumice.XR-ELS
+
+jobs:
+  package-test-publish:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out public release repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Install Velopack CLI
+        shell: pwsh
+        run: dotnet tool install --global vpk --version 1.2.0
+
+      - name: Validate manually supplied server and read embedded metadata
+        id: metadata
+        shell: pwsh
+        env:
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          if ($env:GITHUB_REPOSITORY -ne "pumicedev/XR-ELS-Releases") {
+            throw "This workflow is restricted to pumicedev/XR-ELS-Releases"
+          }
+          $server = "dist\XR-ELS-Server\XR-ELS-Server.exe"
+          $migrator = "dist\XR-ELS-Server\_internal\tools\XR-ELS-DB-Migrator.exe"
+          $firebaseConfig = "dist\XR-ELS-Server\_internal\firebase_config.json"
+          $controlShortcut = "dist\XR-ELS-Server\XRELS Web Control.url"
+          foreach ($requiredFile in @($server, $migrator, $firebaseConfig, $controlShortcut)) {
+            if (-not (Test-Path $requiredFile -PathType Leaf)) {
+              throw "Required manually supplied artifact is missing: $requiredFile"
+            }
+          }
+          $legacyMigrator = "dist\XR-ELS-Server\XR-ELS-DB-Migrator.exe"
+          if (Test-Path $legacyMigrator -PathType Leaf) {
+            throw "Root-level Migrator must be removed: $legacyMigrator"
+          }
+
+          $envFiles = Get-ChildItem "dist\XR-ELS-Server" -Recurse -Force -File |
+            Where-Object { $_.Name -eq ".env" }
+          if ($envFiles) {
+            throw "The supplied server artifact must not contain .env"
+          }
+
+          $metadataStdout = Join-Path $env:RUNNER_TEMP "xrels-release-metadata.jsonl"
+          $metadataStderr = Join-Path $env:RUNNER_TEMP "xrels-release-metadata.log"
+          $metadataProcess = Start-Process -FilePath $server -ArgumentList "--release-metadata" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $metadataStdout -RedirectStandardError $metadataStderr
+          if ($metadataProcess.ExitCode -ne 0) {
+            throw "XR-ELS-Server.exe --release-metadata failed with exit code $($metadataProcess.ExitCode)"
+          }
+          $metadataLine = Get-Content $metadataStdout |
+            ForEach-Object { "$_".Trim() } |
+            Where-Object { $_ -match '^\{.*\}$' } |
+            Select-Object -Last 1
+          if (-not $metadataLine) {
+            throw "Could not read embedded Config release metadata from XR-ELS-Server.exe"
+          }
+          $metadata = $metadataLine | ConvertFrom-Json
+          if ($metadata.version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Embedded Config.API_VERSION is not a valid package version"
+          }
+          if ($metadata.release_date -notmatch '^\d{4}-\d{2}-\d{2}$') {
+            throw "Embedded Config.API_RELEASE_DATE is invalid"
+          }
+          "version=$($metadata.version)" >> $env:GITHUB_OUTPUT
+          "release_date=$($metadata.release_date)" >> $env:GITHUB_OUTPUT
+          Set-Content -Path release-notes.md -Value $env:RELEASE_NOTES
+
+      - name: Configure optional Authenticode signing
+        id: signing
+        shell: pwsh
+        env:
+          REQUIRE_CODE_SIGNING: ${{ vars.REQUIRE_CODE_SIGNING || 'false' }}
+          WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          $required = $env:REQUIRE_CODE_SIGNING -eq "true"
+          $available = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERT_BASE64)
+          if ($required -and -not $available) {
+            throw "REQUIRE_CODE_SIGNING=true but no signing certificate is configured"
+          }
+          if (-not $available) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $certificate = Join-Path $env:RUNNER_TEMP "xrels-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificate,
+            [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT_BASE64)
+          )
+          .\scripts\sign_windows.ps1 `
+            -Files @(
+              "dist\XR-ELS-Server\XR-ELS-Server.exe",
+              "dist\XR-ELS-Server\_internal\tools\XR-ELS-DB-Migrator.exe"
+            ) `
+            -CertificatePath $certificate `
+            -CertificatePassword $env:WINDOWS_SIGNING_CERT_PASSWORD
+          "enabled=true" >> $env:GITHUB_OUTPUT
+          "certificate=$certificate" >> $env:GITHUB_OUTPUT
+
+      - name: Download previous stable release
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force Releases | Out-Null
+          vpk download github `
+            --repoUrl $env:RELEASE_REPOSITORY `
+            --token $env:GH_TOKEN `
+            --channel $env:VPK_CHANNEL `
+            --outputDir Releases
+          gh release download `
+            --repo $env:RELEASE_REPO_SLUG `
+            --pattern "*-full.nupkg" `
+            --pattern "*Setup*.exe" `
+            --dir Releases `
+            --clobber
+
+          $previousFull = Get-ChildItem Releases -Filter "*-full.nupkg" |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $previousFull -or $previousFull.Name -notmatch '-(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-full\.nupkg$') {
+            throw "A parseable previous full package is required for the two-version gate"
+          }
+          $previousVersion = $Matches.version
+          $previousSetup = Get-ChildItem Releases -Filter "*Setup*.exe" |
+            Select-Object -First 1
+          if (-not $previousSetup) {
+            throw "Previous Setup executable is required for the two-version gate"
+          }
+          $archivedSetup = Join-Path Releases "XR-ELS-$previousVersion-Setup.exe"
+          Move-Item $previousSetup.FullName $archivedSetup -Force
+          "setup=$archivedSetup" >> $env:GITHUB_OUTPUT
+
+      - name: Create full, delta, Setup, and stable feed
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+          CERTIFICATE_PATH: ${{ steps.signing.outputs.certificate }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          $arguments = @(
+            "pack",
+            "--packId", $env:VPK_PACK_ID,
+            "--packVersion", $env:VERSION,
+            "--packDir", "dist\XR-ELS-Server",
+            "--mainExe", "XR-ELS-Server.exe",
+            "--packAuthors", "Pumice",
+            "--packTitle", "XR-ELS Server",
+            "--releaseNotes", "release-notes.md",
+            "--channel", $env:VPK_CHANNEL,
+            "--outputDir", "Releases"
+          )
+          $icon = "dist\XR-ELS-Server\_internal\Frontend\public\favicon.ico"
+          if (Test-Path $icon -PathType Leaf) {
+            $arguments += @("--icon", $icon)
+          }
+          if ($env:SIGNING_ENABLED -eq "true") {
+            $signParams = "/a /fd SHA256 /f `"$env:CERTIFICATE_PATH`" /p `"$env:WINDOWS_SIGNING_CERT_PASSWORD`" /tr http://timestamp.digicert.com /td SHA256"
+            $arguments += @("--signParams", $signParams)
+          }
+          & vpk @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "Velopack packaging failed"
+          }
+
+      - name: Run two-version local package gate
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: .\scripts\test_windows_release_e2e.ps1 -ReleaseDir Releases -CurrentVersion $env:VERSION -InstallRoot (Join-Path $env:RUNNER_TEMP "xrels-e2e")
+
+      - name: Enforce Authenticode signatures when enabled
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem Releases -Filter "*Setup*.exe" |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          $targets = @(
+            "dist\XR-ELS-Server\XR-ELS-Server.exe",
+            "dist\XR-ELS-Server\_internal\tools\XR-ELS-DB-Migrator.exe",
+            $setup.FullName,
+            (Join-Path $env:RUNNER_TEMP "xrels-e2e\Update.exe")
+          )
+          foreach ($target in $targets) {
+            $signature = Get-AuthenticodeSignature $target
+            if ($signature.Status -ne "Valid") {
+              throw "Authenticode validation failed for $target: $($signature.Status)"
+            }
+          }
+
+      - name: Create rollback checksum sidecar
+        id: checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          PREVIOUS_SETUP: ${{ steps.previous.outputs.setup }}
+        run: |
+          if (Test-Path $env:PREVIOUS_SETUP) {
+            Remove-Item $env:PREVIOUS_SETUP -Force
+          }
+          $full = Get-ChildItem Releases -Filter "*-$env:VERSION-full.nupkg" |
+            Select-Object -First 1
+          if (-not $full) {
+            throw "Current full package was not generated"
+          }
+          $sidecar = "$($full.FullName).sha256"
+          $hash = (Get-FileHash $full.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path $sidecar -Value "$hash  $($full.Name)" -NoNewline
+          "sidecar=$sidecar" >> $env:GITHUB_OUTPUT
+
+      - name: Publish stable release
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_DATE: ${{ steps.metadata.outputs.release_date }}
+          VPK_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          SIDECAR: ${{ steps.checksum.outputs.sidecar }}
+        run: |
+          vpk upload github `
+            --repoUrl $env:RELEASE_REPOSITORY `
+            --token $env:VPK_TOKEN `
+            --channel $env:VPK_CHANNEL `
+            --outputDir Releases `
+            --publish `
+            --tag "v$env:VERSION" `
+            --releaseName "XR-ELS Server $env:VERSION ($env:RELEASE_DATE)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Velopack upload failed"
+          }
+          gh release upload "v$env:VERSION" $env:SIDECAR `
+            --repo $env:RELEASE_REPO_SLUG `
+            --clobber
+
+      - name: Preserve release artifacts for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrels-windows-${{ steps.metadata.outputs.version }}
+          path: Releases/
+          if-no-files-found: error
+          retention-days: 14
