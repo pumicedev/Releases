@@ -10,6 +10,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-WaitingProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList
+    )
+
+    $Process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+        -NoNewWindow -Wait -PassThru
+    return [int]$Process.ExitCode
+}
+
 $ReleaseDir = (Resolve-Path $ReleaseDir).Path
 $CurrentFullName = "$PackId-$CurrentVersion-$Channel-full.nupkg"
 $CurrentFull = Get-ChildItem $ReleaseDir -Filter $CurrentFullName |
@@ -52,9 +66,10 @@ if (-not $PreviousSetup) {
 # --silent prevents Setup from launching the server after installation. Passing
 # EXE_ARGS through "--" triggers a Velopack 1.2.0/clap parser panic, and is not
 # needed because the installed executable is verified explicitly below.
-& $PreviousSetup.FullName --silent --installto $InstallRoot
-if ($LASTEXITCODE -ne 0) {
-    throw "Previous-version installation failed"
+$SetupExitCode = Invoke-WaitingProcess -FilePath $PreviousSetup.FullName `
+    -ArgumentList @("--silent", "--installto", $InstallRoot)
+if ($SetupExitCode -ne 0) {
+    throw "Previous-version installation failed with exit code $SetupExitCode"
 }
 
 $UpdateExe = Join-Path $InstallRoot "Update.exe"
@@ -72,21 +87,27 @@ function Assert-InstalledVersion([string]$Expected) {
 
 Assert-InstalledVersion $PreviousVersion
 
-& $UpdateExe --silent apply --package $CurrentFull.FullName --norestart
-if ($LASTEXITCODE -ne 0) {
-    throw "Local-feed update to $CurrentVersion failed"
+$UpdateExitCode = Invoke-WaitingProcess -FilePath $UpdateExe -ArgumentList @(
+    "--silent", "apply", "--package", $CurrentFull.FullName, "--norestart"
+)
+if ($UpdateExitCode -ne 0) {
+    throw "Local-feed update to $CurrentVersion failed with exit code $UpdateExitCode"
 }
 Assert-InstalledVersion $CurrentVersion
 
-& $UpdateExe --silent apply --package $PreviousFull.FullName --norestart
-if ($LASTEXITCODE -ne 0) {
-    throw "Program rollback to $PreviousVersion failed"
+$RollbackExitCode = Invoke-WaitingProcess -FilePath $UpdateExe -ArgumentList @(
+    "--silent", "apply", "--package", $PreviousFull.FullName, "--norestart"
+)
+if ($RollbackExitCode -ne 0) {
+    throw "Program rollback to $PreviousVersion failed with exit code $RollbackExitCode"
 }
 Assert-InstalledVersion $PreviousVersion
 
-& $UpdateExe --silent apply --package $CurrentFull.FullName --norestart
-if ($LASTEXITCODE -ne 0) {
-    throw "Post-rollback update to $CurrentVersion failed"
+$ReupdateExitCode = Invoke-WaitingProcess -FilePath $UpdateExe -ArgumentList @(
+    "--silent", "apply", "--package", $CurrentFull.FullName, "--norestart"
+)
+if ($ReupdateExitCode -ne 0) {
+    throw "Post-rollback update to $CurrentVersion failed with exit code $ReupdateExitCode"
 }
 Assert-InstalledVersion $CurrentVersion
 
