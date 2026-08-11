@@ -3,6 +3,10 @@ name: Windows stable release
 on:
   workflow_dispatch:
     inputs:
+      staging_tag:
+        description: Draft Release tag containing XR-ELS-Server-input.zip
+        required: true
+        type: string
       release_notes:
         description: Markdown release notes
         required: true
@@ -20,6 +24,7 @@ env:
   RELEASE_REPO_SLUG: ${{ github.repository }}
   VPK_CHANNEL: stable
   VPK_PACK_ID: Pumice.XR-ELS
+  STAGING_ASSET_NAME: XR-ELS-Server-input.zip
 
 jobs:
   package-test-publish:
@@ -29,8 +34,85 @@ jobs:
       - name: Check out public release repository
         uses: actions/checkout@v4
         with:
-          lfs: true
           fetch-depth: 1
+
+      - name: Download and verify Draft Release input
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          if ($env:STAGING_TAG -notmatch '^staging-windows-[0-9]{8}-[0-9]{6}$') {
+            throw "Staging tag must use staging-windows-YYYYMMDD-HHMMSS"
+          }
+
+          $releaseJson = gh release view $env:STAGING_TAG --repo $env:RELEASE_REPO_SLUG --json isDraft,tagName
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read Draft Release $env:STAGING_TAG"
+          }
+          $release = $releaseJson | ConvertFrom-Json
+          if (-not $release.isDraft) {
+            throw "Staging Release must remain a draft"
+          }
+          if ($release.tagName -ne $env:STAGING_TAG) {
+            throw "Draft Release tag does not match the requested staging tag"
+          }
+
+          $stagingDir = Join-Path $env:RUNNER_TEMP "xrels-staging"
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          gh release download $env:STAGING_TAG --repo $env:RELEASE_REPO_SLUG --pattern $env:STAGING_ASSET_NAME --pattern "$env:STAGING_ASSET_NAME.sha256" --dir $stagingDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not download Draft Release input"
+          }
+
+          $stagingZip = Join-Path $stagingDir $env:STAGING_ASSET_NAME
+          $checksumFile = "$stagingZip.sha256"
+          foreach ($requiredFile in @($stagingZip, $checksumFile)) {
+            if (-not (Test-Path $requiredFile -PathType Leaf)) {
+              throw "Draft Release asset is missing: $(Split-Path -Leaf $requiredFile)"
+            }
+          }
+
+          $checksumParts = ((Get-Content $checksumFile -Raw).Trim() -split '\s+')
+          if ($checksumParts.Count -ne 2 -or $checksumParts[0] -notmatch '^[0-9a-fA-F]{64}$') {
+            throw "Draft Release checksum sidecar is invalid"
+          }
+          if ($checksumParts[1] -ne $env:STAGING_ASSET_NAME) {
+            throw "Draft Release checksum sidecar names an unexpected file"
+          }
+          $expectedHash = $checksumParts[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash $stagingZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Draft Release ZIP checksum verification failed"
+          }
+
+          $archiveEntries = & tar.exe -tf $stagingZip
+          if ($LASTEXITCODE -ne 0 -or -not $archiveEntries) {
+            throw "Draft Release ZIP could not be listed"
+          }
+          foreach ($entry in $archiveEntries) {
+            $normalized = "$entry".Replace('\', '/').TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($normalized)) {
+              continue
+            }
+            if ($normalized.StartsWith('/') -or
+                $normalized -match '^[A-Za-z]:' -or
+                $normalized -match '(^|/)\.\.(/|$)' -or
+                ($normalized -ne 'XR-ELS-Server' -and -not $normalized.StartsWith('XR-ELS-Server/'))) {
+              throw "Draft Release ZIP contains an unsafe or unexpected path: $entry"
+            }
+          }
+
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          & tar.exe -xf $stagingZip -C dist
+          if ($LASTEXITCODE -ne 0) {
+            throw "Draft Release ZIP extraction failed"
+          }
+          $reparsePoints = Get-ChildItem "dist\XR-ELS-Server" -Recurse -Force |
+            Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+          if ($reparsePoints) {
+            throw "Draft Release ZIP must not contain reparse points"
+          }
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -181,7 +263,7 @@ jobs:
             "--packDir", "dist\XR-ELS-Server",
             "--mainExe", "XR-ELS-Server.exe",
             "--packAuthors", "Pumice",
-            "--packTitle", "XR-ELS Server",
+            "--packTitle", "XR-ELS-Server",
             "--releaseNotes", "release-notes.md",
             "--channel", $env:VPK_CHANNEL,
             "--outputDir", "Releases"
@@ -221,7 +303,7 @@ jobs:
           foreach ($target in $targets) {
             $signature = Get-AuthenticodeSignature $target
             if ($signature.Status -ne "Valid") {
-              throw "Authenticode validation failed for $target: $($signature.Status)"
+              throw "Authenticode validation failed for ${target}: $($signature.Status)"
             }
           }
 
@@ -269,6 +351,18 @@ jobs:
           gh release upload "v$env:VERSION" $env:SIDECAR `
             --repo $env:RELEASE_REPO_SLUG `
             --clobber
+
+      - name: Delete successful Draft Release input
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_TAG: ${{ inputs.staging_tag }}
+        run: |
+          gh release delete $env:STAGING_TAG --repo $env:RELEASE_REPO_SLUG --cleanup-tag --yes
+          if ($LASTEXITCODE -ne 0) {
+            throw "Stable Release succeeded, but Draft Release cleanup failed: $env:STAGING_TAG"
+          }
 
       - name: Preserve release artifacts for inspection
         if: always()

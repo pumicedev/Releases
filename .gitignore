@@ -1,4 +1,8 @@
 Releases/
+dist/
+staging/
 release-notes.md
+XR-ELS-Server-input.zip
+XR-ELS-Server-input.zip.sha256
 *.pfx
 *.tmp
