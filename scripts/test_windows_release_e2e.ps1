@@ -49,7 +49,10 @@ if (-not $PreviousSetup) {
     throw "Previous Setup executable $PreviousVersion is required for the release gate"
 }
 
-& $PreviousSetup.FullName --silent --installto $InstallRoot -- --version
+# --silent prevents Setup from launching the server after installation. Passing
+# EXE_ARGS through "--" triggers a Velopack 1.2.0/clap parser panic, and is not
+# needed because the installed executable is verified explicitly below.
+& $PreviousSetup.FullName --silent --installto $InstallRoot
 if ($LASTEXITCODE -ne 0) {
     throw "Previous-version installation failed"
 }
