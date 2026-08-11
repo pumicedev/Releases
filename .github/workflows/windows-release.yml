@@ -359,7 +359,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           STAGING_TAG: ${{ inputs.staging_tag }}
         run: |
-          gh release delete $env:STAGING_TAG --repo $env:RELEASE_REPO_SLUG --cleanup-tag --yes
+          gh release delete $env:STAGING_TAG --repo $env:RELEASE_REPO_SLUG --yes
           if ($LASTEXITCODE -ne 0) {
             throw "Stable Release succeeded, but Draft Release cleanup failed: $env:STAGING_TAG"
           }
